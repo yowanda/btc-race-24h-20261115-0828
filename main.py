@@ -53,15 +53,11 @@ deterministic, no clock, no network, no randomness, no files.
 Speaks agent-fun/bars-replay/v1 via the vendored shim
 (vendor/makefun_bars.py, byte-identical to the kit SDK).
 
-Port note: this file is the v6 port for race btc-race-24h-20261115-0828.
-It replaces the v1 port in this repo for the v6 gate check (v4 gate on
-this race's dev window: PnL $0.00, 0 trades — failed; v3 gate: PnL
--$6.34, 6 trades — failed; v1 gate: PnL -$12.24, 8 trades — failed;
-v5 gate: PnL -$5.99, 8 trades — failed on its fixed 0.3% trail).
-v6 gate on this race's dev window: PnL +$14.35, 8 trades, maxDD
--1.62%, determinism IDENTICAL — PASS. Parameters are research-set
-from STRATEGY.md §9, unchanged from the v6 reference; nothing was
-tuned against this race's dev window.
+Port note: this is the v6 port for race btc-race-24h-20261115-0828.
+Gate check v6 on this race's dev window: PnL +$14.35, 8 trades,
+maxDD -1.62%, determinism IDENTICAL — PASS. Gate results of the
+other versions on the same window: v4 $0.00, 0 trades, FAIL;
+v3 -$6.34, FAIL; v1 -$12.24, FAIL; v5 -$5.99, FAIL.
 """
 
 import os
