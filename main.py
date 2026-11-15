@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
-"""BTC race bot v3 — Donchian breakout + trailing exit + strong regime gate.
+"""BTC race bot v1 — multi-timeframe trend-following with momentum trigger.
 
 Long only, one position, full size. Strategy (see STRATEGY.md):
 
-  - Regime gate (higher timeframe, ~4 h) -- the v3 addition: only consider
-    longs when the 240-min return is positive AND the price is above
-    EMA(240). This is the structural fix for the v1/v2 failure mode
-    (buying bounces inside a downtrend): the v2 120-min filter kept
-    passing on local 2-hour bounces while the day trend was down, and
-    the Donchian breakouts then whipsawed 6x for -$29.55. A 4-hour
-    trend gate (2x the 120-min filter, 4x the 60-min breakout window --
-    Elder Triple Screen spacing) only lets the bot in when the
-    medium-term trend itself has turned up. If the window is a
-    downtrend, the bot stays in cash: $0, no bleed.
-  - Trend filter (higher TF, ~2 h, unchanged from v2): 120-min return
-    positive AND price above EMA(120).
-  - Entry (breakout, unchanged from v2): close breaks above the
-    highest close of the last 60 bars (1-hour Donchian high).
-  - Exit (trailing stop, unchanged from v2): sell when the close falls
-    0.3% below the highest close since entry (~the round-trip cost).
+  - Trend filter (higher timeframe, ~2 h): 120-min return > 0 AND price
+    above EMA(120). Elder's rule — never take a long against the higher
+    timeframe.
+  - Entry trigger (middle timeframe, 30 min): 30-min return > +0.3%
+    (30 bps). A 30-min leg of 30 bps is already larger than the ~26 bps
+    round-trip cost, so the move itself has paid for the trade.
+  - Position: 100% of cash on entry (single position max, no leverage).
+  - Minimum hold: 180 bars (3 h) — anti-churn; once in, the bot is
+    forbidden from exiting on noise for 3 hours, so a real leg has time
+    to develop.
+  - Exit, whichever comes first:
+      * Take-profit +0.6% from the fill price.
+      * Trend break after the minimum hold: price below EMA(120), or
+        30-min return < -0.2%. If the medium-term trend that justified
+        the entry is gone, the premise is gone — exit, don't hope.
 
 Pure function of bar closes, integer math only: deterministic, no clock,
 no network, no randomness, no files. Speaks agent-fun/bars-replay/v1 via
 the vendored shim (vendor/makefun_bars.py, byte-identical to the kit SDK).
 
-Port note: this file is the v3 port for race btc-race-24h-20261115-0828.
-It replaces the v4 port in this repo for the v3 gate check (v4 gate on
-this race's dev window: PnL $0.00, 0 trades — failed). Parameters are
-research-set from STRATEGY.md, unchanged from the v3 reference; nothing
-was tuned against this race's dev window.
+Port note: this file is the v1 port for race btc-race-24h-20261115-0828.
+It replaces the v3 port in this repo for the v1 gate check (v4 gate on
+this race's dev window: PnL $0.00, 0 trades — failed; v3 gate: PnL
+-$6.34, 6 trades, maxDD -1.25% — failed). Parameters are research-set
+from STRATEGY.md, unchanged from the v1 reference; nothing was tuned
+against this race's dev window.
 """
 
 import os
@@ -37,12 +37,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-# --- Parameters (research-chosen; see STRATEGY.md) ---------------------------
-REGIME_BARS = 240       # regime-gate lookback: 4 h (2x the trend filter)
-REGIME_EMA_SPAN = 240   # EMA span for the regime gate
-TREND_BARS = 120        # higher-timeframe trend lookback (minutes)
-BREAKOUT_BARS = 60      # Donchian breakout lookback: 1-hour high (minutes)
-TRAIL_BPS = 30          # trailing stop: 0.3% below the peak since entry
+# --- Parameters (research-set from STRATEGY.md, not fitted) ------------------
+TREND_BARS = 120        # trend lookback: 2 h (4x the trigger timeframe)
+TRIGGER_BARS = 30       # entry-trigger lookback: 30 min
+TRIGGER_BPS = 30        # entry trigger: 30-min return > +0.3%
+TP_BPS = 60             # take-profit: +0.6% from the fill price
+EXIT_RET_BPS = -20      # trend-break exit: 30-min return < -0.2%
+MIN_HOLD = 180          # minimum hold: 180 bars (3 h), anti-churn
 EMA_SPAN = 120          # EMA span for the trend filter
 MAX_SLIPPAGE_BPS = 100  # 4x the expected ~26 bps cost; caps gap fills
 BPS = 10_000
@@ -53,10 +54,8 @@ SYMBOL = "CBBTC"
 # --- State ------------------------------------------------------------------
 closes = []             # close prices (ints, price_scale 5), in batch order
 ema_fp = None           # EMA(120) in fixed point (price * EMA_FP)
-ema_regime_fp = None    # EMA(240) in fixed point (price * EMA_FP)
 entry_price = None      # fill price of the open position (int), or None
 entry_seq = -1          # seq of the batch whose fills opened the position
-peak_close = None       # highest close seen while holding (int), or None
 pending_buy = False     # a buy order is decided but not yet filled/rejected
 
 
@@ -66,7 +65,7 @@ def ret_bps(now, then):
 
 
 def on_batch(state, batch):
-    global ema_fp, ema_regime_fp, entry_price, entry_seq, peak_close, pending_buy
+    global ema_fp, entry_price, entry_seq, pending_buy
 
     # --- Fold in this batch's fills first: they settle last batch's orders.
     for fill in batch.get("fills", []):
@@ -77,11 +76,9 @@ def on_batch(state, batch):
             if fill.get("status") == "filled":
                 entry_price = int(fill["price"])
                 entry_seq = state.seq
-                peak_close = None
         elif fill.get("side") == "sell" and fill.get("status") == "filled":
             entry_price = None
             entry_seq = -1
-            peak_close = None
 
     bar = state.latest.get(SYMBOL)
     if bar is None or state.warming_up:
@@ -89,42 +86,38 @@ def on_batch(state, batch):
     close = int(bar["c"])
     closes.append(close)
 
-    # Integer EMAs: seeded on the first close, alpha = 2 / (span + 1).
+    # Integer EMA: seeded on the first close, alpha = 2 / (span + 1).
     if ema_fp is None:
         ema_fp = close * EMA_FP
     else:
         ema_fp += (close * EMA_FP - ema_fp) * 2 // (EMA_SPAN + 1)
-    if ema_regime_fp is None:
-        ema_regime_fp = close * EMA_FP
-    else:
-        ema_regime_fp += (close * EMA_FP - ema_regime_fp) * 2 // (REGIME_EMA_SPAN + 1)
 
     held = state.positions.get(SYMBOL)
     n = len(closes)
 
     # --- Exit: holding a position -------------------------------------------
     if held is not None and held.qty > 0:
-        if peak_close is None or close > peak_close:
-            peak_close = close
-        # Trailing stop: 0.3% below the highest close since entry.
-        if peak_close is not None and close * BPS < peak_close * (BPS - TRAIL_BPS):
-            return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                     "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+        if entry_price is not None:
+            # Take-profit: +0.6% from the fill price.
+            if close * BPS >= entry_price * (BPS + TP_BPS):
+                return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
+                         "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+            # Trend break, only after the minimum hold: price below
+            # EMA(120), or 30-min return < -0.2%.
+            if state.seq - entry_seq >= MIN_HOLD and n > TRIGGER_BARS:
+                if (close * EMA_FP < ema_fp
+                        or ret_bps(close, closes[-TRIGGER_BARS - 1]) < EXIT_RET_BPS):
+                    return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
+                             "max_slippage_bps": MAX_SLIPPAGE_BPS}]
         return []
 
     # --- Entry: flat ---------------------------------------------------------
-    # Need a full 240-bar regime window (covers the 120-bar trend and
-    # 60-bar breakout windows too).
-    if pending_buy or n <= REGIME_BARS:
+    if pending_buy or n <= TREND_BARS:
         return []
     ret_trend = ret_bps(close, closes[-TREND_BARS - 1])
+    ret_trig = ret_bps(close, closes[-TRIGGER_BARS - 1])
     above_ema = close * EMA_FP > ema_fp
-    # Regime gate (v3): 4-hour trend must itself be up.
-    ret_regime = ret_bps(close, closes[-REGIME_BARS - 1])
-    above_regime_ema = close * EMA_FP > ema_regime_fp
-    breakout = close > max(closes[-BREAKOUT_BARS - 1:-1])
-    if (ret_regime > 0 and above_regime_ema
-            and ret_trend > 0 and above_ema and breakout):
+    if ret_trend > 0 and ret_trig > TRIGGER_BPS and above_ema:
         cash = state.cash
         if cash <= 0:
             return []
