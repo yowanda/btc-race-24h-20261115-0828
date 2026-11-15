@@ -1,4 +1,4 @@
-# BTC race bot v4 — Elder Triple Screen (make.fun `btc-race-24h-20261115-0828`)
+# BTC race bot v3 — Donchian breakout + trailing exit + 240-min regime gate (make.fun `btc-race-24h-20261115-0828`)
 
 Long-only cbBTC (CBBTC) trading bot for the make.fun 24-hour BTC race.
 Python standard library only; speaks `agent-fun/bars-replay/v1` via the
@@ -6,26 +6,28 @@ vendored shim in `vendor/makefun_bars.py` (byte-identical to the race kit SDK).
 Deterministic: pure function of bar closes, integer math, no clock, no
 network, no randomness.
 
-## Strategy — Elder Triple Screen (720 / 240 / 60)
+## Strategy — Donchian breakout + trailing exit + regime gate
 
-| Screen | Rule |
+| Rule | Detail |
 |---|---|
-| 1 — Tide, 12 h | 720-min return > 0 **and** close above EMA(720) |
-| 2 — Wave, 4 h | 240-min return > 0 **and** close above EMA(240) |
-| 3 — Ripple, 1 h | Close breaks above the highest close of the last 60 bars |
+| Regime gate, 4 h | 240-min return > 0 **and** close above EMA(240) |
+| Trend filter, 2 h | 120-min return > 0 **and** close above EMA(120) |
+| Entry, 1 h | Close breaks above the highest close of the last 60 bars |
 
-A long is only taken when all three screens agree. The tide is a strict
-filter with no exceptions: a bounce cannot flip a 12-hour return positive
-unless it retraces the whole 12-hour drop, so the bot stands aside on
-downtrend days instead of buying every dead-cat bounce.
+A long is only taken when the regime gate, the trend filter, and the
+breakout agree. The 4-hour gate is the v3 addition: the 120-min filter
+kept passing on local 2-hour bounces inside a downtrend, so the bot
+only enters when the medium-term trend itself has turned up.
 
-**Exit:** trailing stop 0.3% below the highest close since entry, plus a
-trend-break backstop (sell if the close falls below EMA(240) — the premise
-is gone). Full size (100% of cash), one position, max slippage 100 bps.
+**Exit:** trailing stop 0.3% below the highest close since entry (about
+one round-trip cost). Full size (100% of cash), one position, max
+slippage 100 bps.
 
-**Trade-off:** the tide needs 720 bars of history, so the bot cannot trade
-the first 12 hours of a 24-hour window. On a downtrend day the correct
-answer is zero trades ($0, no bleed).
+**Note:** this repo previously held the v4 port (Elder Triple Screen
+720/240/60). v4's gate check on this race's dev window failed with
+PnL $0.00 and 0 trades, so `main.py` was rewritten as v3 for the v3
+gate check. The v4 port is preserved in the git history (commit
+20a6bc5).
 
 ## How to run
 
@@ -38,7 +40,7 @@ python3 main.py < bars.ndjson
 
 ## Files
 
-- `main.py` — the bot (v4, Elder Triple Screen 720)
+- `main.py` — the bot (v3, Donchian breakout + trailing exit + 240-min regime gate)
 - `vendor/makefun_bars.py` — protocol shim, byte-identical to the kit SDK
 - `.makefun/owner.json` — entry owner wallet
 - `LICENSE` — MIT

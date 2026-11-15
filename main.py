@@ -1,44 +1,34 @@
 #!/usr/bin/env python3
-"""BTC race bot v4 — Elder Triple Screen: tide 720 min, wave 240 min, ripple 60 min.
+"""BTC race bot v3 — Donchian breakout + trailing exit + strong regime gate.
 
-Long only, one position, full size. The bot trades cbBTC (CBBTC) against
-USDC on 1-minute bars, speaking agent-fun/bars-replay/v1 through the
-vendored shim (vendor/makefun_bars.py, byte-identical to the race kit SDK).
+Long only, one position, full size. Strategy (see STRATEGY.md):
 
-Why three screens (see STRATEGY.md): on the previous race's dev window the
-bot kept buying dead-cat bounces inside a downtrend. A 240-minute gate is
-flippable by a single strong bounce hour, and a Donchian breakout fires at
-the top of that bounce — so every round trip bled about one round-trip
-cost. Elder's Triple Screen fixes this structurally: screen one is a
-strict filter with no exceptions. A long is only considered when the
-day-scale tide itself is up; the wave must agree; only then does the
-1-hour breakout trigger an entry.
-
-  Screen 1 — TIDE (12 h): 720-min return > 0 AND close above EMA(720).
-    A bounce can only flip a 12-hour return positive by retracing the
-    whole 12-hour drop, i.e. a genuine reversal, not a bounce. On the
-    -4.91% dev window this gate was open 0/720 bars.
-  Screen 2 — WAVE (4 h): 240-min return > 0 AND close above EMA(240).
-    The medium-term trend must be up; a 1-hour bounce cannot flip it.
-  Screen 3 — RIPPLE (1 h): close breaks above the highest close of the
-    last 60 bars (Donchian breakout). Fires at the start of a leg.
-
-  Exit — TRAILING STOP: sell when the close falls 0.3% below the highest
-    close since entry (about one round-trip cost, ~26 bps).
-  Exit — TREND-BREAK BACKSTOP: sell if the close falls below EMA(240).
-    The 4-hour trend that justified the entry is gone, so the premise is
-    gone. Covers slow rollovers where price drifts under the trend
-    without a sharp pullback from the peak.
-
-Known trade-off, stated up front: the tide needs 720 bars of history,
-so the bot cannot trade the first 12 hours of a 24-hour window. That is
-the price of the filter. Trends persist, so the second half of a genuine
-uptrend day still has up-moves to catch, and the bot only needs ONE good
-round trip to pass the dev gate. On a downtrend day the correct answer is
-zero trades ($0, no bleed) rather than four losing bounces.
+  - Regime gate (higher timeframe, ~4 h) -- the v3 addition: only consider
+    longs when the 240-min return is positive AND the price is above
+    EMA(240). This is the structural fix for the v1/v2 failure mode
+    (buying bounces inside a downtrend): the v2 120-min filter kept
+    passing on local 2-hour bounces while the day trend was down, and
+    the Donchian breakouts then whipsawed 6x for -$29.55. A 4-hour
+    trend gate (2x the 120-min filter, 4x the 60-min breakout window --
+    Elder Triple Screen spacing) only lets the bot in when the
+    medium-term trend itself has turned up. If the window is a
+    downtrend, the bot stays in cash: $0, no bleed.
+  - Trend filter (higher TF, ~2 h, unchanged from v2): 120-min return
+    positive AND price above EMA(120).
+  - Entry (breakout, unchanged from v2): close breaks above the
+    highest close of the last 60 bars (1-hour Donchian high).
+  - Exit (trailing stop, unchanged from v2): sell when the close falls
+    0.3% below the highest close since entry (~the round-trip cost).
 
 Pure function of bar closes, integer math only: deterministic, no clock,
-no network, no randomness, no files.
+no network, no randomness, no files. Speaks agent-fun/bars-replay/v1 via
+the vendored shim (vendor/makefun_bars.py, byte-identical to the kit SDK).
+
+Port note: this file is the v3 port for race btc-race-24h-20261115-0828.
+It replaces the v4 port in this repo for the v3 gate check (v4 gate on
+this race's dev window: PnL $0.00, 0 trades — failed). Parameters are
+research-set from STRATEGY.md, unchanged from the v3 reference; nothing
+was tuned against this race's dev window.
 """
 
 import os
@@ -47,50 +37,43 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-# --- Parameters (research-chosen, see STRATEGY.md; not fitted to any window)
-TIDE_BARS = 720          # screen 1 lookback: 12 h
-TIDE_EMA_SPAN = 720      # EMA span for the tide gate
-WAVE_BARS = 240          # screen 2 lookback: 4 h
-EMA_SPAN = 240           # EMA span for the wave filter / exit backstop
-BREAKOUT_BARS = 60       # screen 3: 1-hour Donchian high, in minutes
-TRAIL_BPS = 30           # trailing stop: 0.3% below the peak since entry
-MAX_SLIPPAGE_BPS = 100   # 4x the expected ~26 bps cost; caps gap fills
+# --- Parameters (research-chosen; see STRATEGY.md) ---------------------------
+REGIME_BARS = 240       # regime-gate lookback: 4 h (2x the trend filter)
+REGIME_EMA_SPAN = 240   # EMA span for the regime gate
+TREND_BARS = 120        # higher-timeframe trend lookback (minutes)
+BREAKOUT_BARS = 60      # Donchian breakout lookback: 1-hour high (minutes)
+TRAIL_BPS = 30          # trailing stop: 0.3% below the peak since entry
+EMA_SPAN = 120          # EMA span for the trend filter
+MAX_SLIPPAGE_BPS = 100  # 4x the expected ~26 bps cost; caps gap fills
 BPS = 10_000
-EMA_FP = 1_000_000       # fixed-point scale for the integer EMAs
+EMA_FP = 1_000_000      # fixed-point scale for the integer EMA
 
 SYMBOL = "CBBTC"
 
 # --- State ------------------------------------------------------------------
-closes = []             # closes (ints, price_scale 5), in batch order
-ema_wave_fp = None      # EMA(240) in fixed point (price * EMA_FP)
-ema_tide_fp = None      # EMA(720) in fixed point (price * EMA_FP)
+closes = []             # close prices (ints, price_scale 5), in batch order
+ema_fp = None           # EMA(120) in fixed point (price * EMA_FP)
+ema_regime_fp = None    # EMA(240) in fixed point (price * EMA_FP)
 entry_price = None      # fill price of the open position (int), or None
 entry_seq = -1          # seq of the batch whose fills opened the position
 peak_close = None       # highest close seen while holding (int), or None
-buy_pending = False     # a buy order is decided but not yet filled/rejected
+pending_buy = False     # a buy order is decided but not yet filled/rejected
 
 
 def ret_bps(now, then):
-    """Return from `then` to `now` in basis points, integer math."""
+    """Return from `then` to `now` in basis points (integer math)."""
     return (now - then) * BPS // then
 
 
-def _ema_step(prev_fp, close, span):
-    """One integer EMA step; alpha = 2 / (span + 1)."""
-    if prev_fp is None:
-        return close * EMA_FP
-    return prev_fp + (close * EMA_FP - prev_fp) * 2 // (span + 1)
-
-
 def on_batch(state, batch):
-    global ema_wave_fp, ema_tide_fp, entry_price, entry_seq, peak_close, buy_pending
+    global ema_fp, ema_regime_fp, entry_price, entry_seq, peak_close, pending_buy
 
-    # --- Settle last batch's orders first: fills arrive with this batch.
+    # --- Fold in this batch's fills first: they settle last batch's orders.
     for fill in batch.get("fills", []):
         if fill.get("symbol") != SYMBOL:
             continue
         if fill.get("side") == "buy":
-            buy_pending = False
+            pending_buy = False
             if fill.get("status") == "filled":
                 entry_price = int(fill["price"])
                 entry_seq = state.seq
@@ -106,8 +89,15 @@ def on_batch(state, batch):
     close = int(bar["c"])
     closes.append(close)
 
-    ema_wave_fp = _ema_step(ema_wave_fp, close, EMA_SPAN)
-    ema_tide_fp = _ema_step(ema_tide_fp, close, TIDE_EMA_SPAN)
+    # Integer EMAs: seeded on the first close, alpha = 2 / (span + 1).
+    if ema_fp is None:
+        ema_fp = close * EMA_FP
+    else:
+        ema_fp += (close * EMA_FP - ema_fp) * 2 // (EMA_SPAN + 1)
+    if ema_regime_fp is None:
+        ema_regime_fp = close * EMA_FP
+    else:
+        ema_regime_fp += (close * EMA_FP - ema_regime_fp) * 2 // (REGIME_EMA_SPAN + 1)
 
     held = state.positions.get(SYMBOL)
     n = len(closes)
@@ -120,35 +110,29 @@ def on_batch(state, batch):
         if peak_close is not None and close * BPS < peak_close * (BPS - TRAIL_BPS):
             return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
                      "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-        # Trend-break backstop: close below EMA(240) — premise gone, exit.
-        if close * EMA_FP < ema_wave_fp:
-            return [{"side": "sell", "symbol": SYMBOL, "qty": held.qty,
-                     "max_slippage_bps": MAX_SLIPPAGE_BPS}]
         return []
 
     # --- Entry: flat ---------------------------------------------------------
-    # A full 720-bar tide window is required (it covers the 240-bar wave
-    # and the 60-bar breakout windows too).
-    if buy_pending or n <= TIDE_BARS:
+    # Need a full 240-bar regime window (covers the 120-bar trend and
+    # 60-bar breakout windows too).
+    if pending_buy or n <= REGIME_BARS:
         return []
-    # Screen 1 (tide, 12 h): the day-scale trend itself must be up.
-    tide_up = (ret_bps(close, closes[-TIDE_BARS - 1]) > 0
-               and close * EMA_FP > ema_tide_fp)
-    # Screen 2 (wave, 4 h): the medium-term trend must be up.
-    wave_up = (ret_bps(close, closes[-WAVE_BARS - 1]) > 0
-               and close * EMA_FP > ema_wave_fp)
-    # Screen 3 (ripple, 1 h): breakout above the 1-hour high.
+    ret_trend = ret_bps(close, closes[-TREND_BARS - 1])
+    above_ema = close * EMA_FP > ema_fp
+    # Regime gate (v3): 4-hour trend must itself be up.
+    ret_regime = ret_bps(close, closes[-REGIME_BARS - 1])
+    above_regime_ema = close * EMA_FP > ema_regime_fp
     breakout = close > max(closes[-BREAKOUT_BARS - 1:-1])
-    if tide_up and wave_up and breakout:
+    if (ret_regime > 0 and above_regime_ema
+            and ret_trend > 0 and above_ema and breakout):
         cash = state.cash
         if cash <= 0:
             return []
-        buy_pending = True
+        pending_buy = True
         return [{"side": "buy", "symbol": SYMBOL,
                  "notional_quote_units": cash,
                  "max_slippage_bps": MAX_SLIPPAGE_BPS}]
     return []
 
 
-# --- Entry point: the shim owns the wire (stdin JSON lines -> stdout replies).
 makefun_bars.run(on_batch)
